@@ -8,13 +8,16 @@ import (
 )
 
 type Config struct {
-	Port                string
-	Environment         string
-	GoogleClientID      string
-	GoogleClientSecret  string
-	GoogleRedirectURL   string
-	SessionSecret       string
-	FrontendURL         string
+	Port               string
+	Environment        string
+	GoogleClientID     string
+	GoogleClientSecret string
+	GoogleRedirectURL  string
+	SessionSecret      string
+	FrontendURL        string
+	JWTSecret          string
+	DatabaseURL        string
+	CORSOrigins        string
 }
 
 func Load() (*Config, error) {
@@ -29,6 +32,9 @@ func Load() (*Config, error) {
 		GoogleRedirectURL:  getEnv("GOOGLE_REDIRECT_URL", "http://localhost:8080/auth/google/callback"),
 		SessionSecret:      getEnv("SESSION_SECRET", "change-this-secret-key"),
 		FrontendURL:        getEnv("FRONTEND_URL", "http://localhost:3000"),
+		JWTSecret:          getEnv("JWT_SECRET", "change-this-jwt-secret"),
+		DatabaseURL:        getEnv("DATABASE_URL", ""),
+		CORSOrigins:        getEnv("CORS_ORIGINS", "http://localhost:3000"),
 	}
 
 	// Validate required fields
@@ -37,6 +43,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.GoogleClientSecret == "" {
 		return nil, fmt.Errorf("GOOGLE_CLIENT_SECRET is required")
+	}
+	if cfg.DatabaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
 
 	return cfg, nil

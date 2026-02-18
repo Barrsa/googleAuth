@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 	"github.com/googleAuth/config"
+	"github.com/googleAuth/database"
+	"github.com/googleAuth/middleware"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -20,6 +23,7 @@ type AuthHandler struct {
 	config     *config.Config
 	oauth2Conf *oauth2.Config
 	store      cookie.Store
+	db         *database.DB
 }
 
 type GoogleUserInfo struct {
@@ -33,7 +37,7 @@ type GoogleUserInfo struct {
 	Locale        string `json:"locale"`
 }
 
-func NewAuthHandler(cfg *config.Config) *AuthHandler {
+func NewAuthHandler(cfg *config.Config, db *database.DB) *AuthHandler {
 	oauth2Conf := &oauth2.Config{
 		ClientID:     cfg.GoogleClientID,
 		ClientSecret: cfg.GoogleClientSecret,
@@ -58,6 +62,7 @@ func NewAuthHandler(cfg *config.Config) *AuthHandler {
 		config:     cfg,
 		oauth2Conf: oauth2Conf,
 		store:      store,
+		db:         db,
 	}
 }
 
@@ -70,7 +75,7 @@ func (h *AuthHandler) GetStore() cookie.Store {
 func (h *AuthHandler) Login(c *gin.Context) {
 	// Generate state token for CSRF protection
 	state := generateStateToken()
-	
+
 	// Save state in session
 	session := sessions.Default(c)
 	session.Set("oauth_state", state)
@@ -84,7 +89,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	c.Redirect(http.StatusTemporaryRedirect, url)
 }
 
-// Callback handles the OAuth callback from Google
+// Callback handles the OAuth callback from Google — persists user to DB, issues JWT, and redirects.
 func (h *AuthHandler) Callback(c *gin.Context) {
 	// Verify state token
 	session := sessions.Default(c)
@@ -96,6 +101,7 @@ func (h *AuthHandler) Callback(c *gin.Context) {
 
 	// Clear state from session
 	session.Delete("oauth_state")
+	_ = session.Save()
 
 	// Exchange authorization code for token
 	code := c.Query("code")
@@ -111,32 +117,149 @@ func (h *AuthHandler) Callback(c *gin.Context) {
 	}
 
 	// Get user info from Google
-	userInfo, err := h.getUserInfo(token.AccessToken)
+	gUser, err := h.getUserInfo(token.AccessToken)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to get user info: %v", err)})
 		return
 	}
 
-	// Save user info and token in session
-	session.Set("user", userInfo)
-	session.Set("access_token", token.AccessToken)
-	if token.RefreshToken != "" {
-		session.Set("refresh_token", token.RefreshToken)
+	// Persist to database
+	user, created, err := h.db.FindOrCreateByGoogle(gUser.ID, gUser.Email, gUser.Name, gUser.Picture)
+	if err != nil {
+		log.Printf("Database error during callback: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save user"})
+		return
 	}
-	if err := session.Save(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save session"})
+	if created {
+		log.Printf("New user created: %s (%s)", user.Email, user.ID)
+	}
+
+	// Generate JWT
+	jwt, err := middleware.GenerateJWT(h.config.JWTSecret, user.ID, user.Email)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
 	}
 
-	// Redirect to frontend or return user info
-	c.Redirect(http.StatusTemporaryRedirect, h.config.FrontendURL+"/auth/success")
+	// Redirect to frontend with token
+	c.Redirect(http.StatusTemporaryRedirect, h.config.FrontendURL+"/auth/callback?token="+jwt)
 }
 
-// Profile returns the current user's profile
+// AuthMe returns the current user from a JWT Bearer token (used by frontend callback).
+func (h *AuthHandler) AuthMe(c *gin.Context) {
+	userID, _ := c.Get("userId")
+	user, err := h.db.FindByID(userID.(string))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "User not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"id":          user.ID,
+			"email":       user.Email,
+			"username":    user.Username,
+			"displayName": user.DisplayName,
+			"avatarUrl":   user.AvatarURL,
+			"isVerified":  user.IsVerified,
+			"createdAt":   user.CreatedAt,
+		},
+	})
+}
+
+// GetMe returns the authenticated user's profile (JWT protected).
+func (h *AuthHandler) GetMe(c *gin.Context) {
+	userID, _ := c.Get("userId")
+	user, err := h.db.FindByID(userID.(string))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"user": gin.H{
+			"id":          user.ID,
+			"email":       user.Email,
+			"username":    user.Username,
+			"displayName": user.DisplayName,
+			"avatarUrl":   user.AvatarURL,
+			"isVerified":  user.IsVerified,
+			"createdAt":   user.CreatedAt,
+		},
+	})
+}
+
+// UpdateMe updates the authenticated user's profile.
+func (h *AuthHandler) UpdateMe(c *gin.Context) {
+	userID, _ := c.Get("userId")
+
+	var body struct {
+		Username    *string `json:"username"`
+		DisplayName *string `json:"displayName"`
+		AvatarURL   *string `json:"avatarUrl"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// If username is being set, check availability first
+	if body.Username != nil {
+		available, err := h.db.CheckUsername(*body.Username)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check username"})
+			return
+		}
+		if !available {
+			// Check if the user already owns this username
+			existing, _ := h.db.FindByID(userID.(string))
+			if existing == nil || existing.Username != *body.Username {
+				c.JSON(http.StatusConflict, gin.H{"error": "Username already taken"})
+				return
+			}
+		}
+	}
+
+	user, err := h.db.UpdateUser(userID.(string), body.Username, body.DisplayName, body.AvatarURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update profile"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"user": gin.H{
+			"id":          user.ID,
+			"email":       user.Email,
+			"username":    user.Username,
+			"displayName": user.DisplayName,
+			"avatarUrl":   user.AvatarURL,
+			"isVerified":  user.IsVerified,
+			"createdAt":   user.CreatedAt,
+		},
+	})
+}
+
+// CheckUsername checks if a username is available.
+func (h *AuthHandler) CheckUsername(c *gin.Context) {
+	username := c.Query("username")
+	if username == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "username query parameter required"})
+		return
+	}
+
+	available, err := h.db.CheckUsername(username)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check username"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"available": available, "username": username})
+}
+
+// Profile returns the current user's profile from session (legacy).
 func (h *AuthHandler) Profile(c *gin.Context) {
 	session := sessions.Default(c)
 	user := session.Get("user")
-	
+
 	if user == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Not authenticated"})
 		return
